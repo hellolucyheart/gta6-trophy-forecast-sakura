@@ -43,9 +43,9 @@ reasons, so the forecast models them separately and recombines them:
     random walk 0.5 * sqrt(horizon in days); the residual scatter of the
     logit fit; a trend-uncertainty term that grows with the extrapolation
     distance in x; and half the largest single-read logit jump seen in the
-    window (Exophase refreshes arrive as steps, and the answer is the
-    first read in the target hour, so a refresh may still land between
-    the last read and the target). s is floored at 0.55 and capped at 2.0
+    window, winsorized at 3x its 90th percentile so a lone boundary
+    artefact (a trophy crossing 100%, where logit explodes) cannot pin the
+    spread at its cap. s is floored at 0.55 and capped at 2.0
     logit units, so even a 90-minute practice case carries a band wide
     enough to survive a refresh it has not seen.
 
@@ -102,6 +102,7 @@ SPREAD_FLOOR = 0.55
 SPREAD_CAP = 2.0
 TREND_UNC_PER_X = 0.35    # trend uncertainty per unit of extrapolation in x
 JUMP_FRACTION = 0.5       # share of the largest observed step kept as spread
+JUMP_WINSOR = 3.0         # largest step capped at this multiple of its p90
 DEFAULT_RESID = 0.30      # residual scatter assumed when no fit exists
 SATURATED_RATE = 99.0     # a trophy at/above this only dilutes
 SATURATED_DILUTION = 0.15  # exponent of the dilution prior for saturated trophies
@@ -268,9 +269,20 @@ def forecast_trophy(idx: int, trophy: dict, case: dict,
     walk = WALK_SIGMA * math.sqrt(horizon_days)
     resid = fit_y[2] if fit_y is not None else DEFAULT_RESID
     trend_unc = TREND_UNC_PER_X * dx
-    jump = 0.0
-    for a, b in zip(ys, ys[1:]):
-        jump = max(jump, abs(b - a))
+    # Largest single-read step, winsorized at JUMP_WINSOR times the 90th
+    # percentile of steps. A lone huge logit jump is usually a boundary
+    # artefact, not a refresh: a trophy drifting 99.78% -> 100% moves 0.22
+    # points but reads as a 3.09 logit "step" because logit explodes at the
+    # 100% clamp (same at 0%, where 2-decimal rounding does it). Capping the
+    # max at 3x the p90 keeps genuine repeated refresh steps, which pass
+    # through untouched, while one freak read can no longer pin the spread
+    # at its cap on its own.
+    jumps = sorted(abs(b - a) for a, b in zip(ys, ys[1:]))
+    if jumps:
+        p90 = jumps[int(0.9 * (len(jumps) - 1))]
+        jump = min(jumps[-1], JUMP_WINSOR * p90)
+    else:
+        jump = 0.0
     jump *= JUMP_FRACTION
     if not ys:
         jump = DEFAULT_RESID
